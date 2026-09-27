@@ -1,0 +1,5 @@
+/target/
+.zolo/
+__pycache__/
+*.pyc
+/tests/zolo.lock

@@ -1,0 +1,78 @@
+//! Executed by s3_streaming.py against the authenticated multipart fixture.
+use std::os
+use std::stream
+use std::hash
+use object_store::{S3Config, S3Client, CredentialProvider, Credentials, PutResult, GetStreamResult}
+
+fn written(result: PutResult) -> str {
+  return match result { .Written(etag) => etag, .Conflict => panic("unexpected CAS conflict") }
+}
+
+fn main() {
+  let endpoint = os.getenv("OBJECT_STORE_TEST_ENDPOINT") ?? ""
+  let input = os.getenv("OBJECT_STORE_TEST_FILE") ?? ""
+  let output = os.getenv("OBJECT_STORE_TEST_DOWNLOAD") ?? ""
+  let size = stream.open(input).unwrap()
+  let length = size.size().unwrap()
+  size.close().unwrap()
+  let digest = hash.sha256_file(input, length).unwrap()
+  let environment = CredentialProvider::environment()
+  let single = S3Client::connect(S3Config {
+    endpoint: endpoint, bucket: "gitwall", region: "us-east-1",
+    credential_provider: environment, timeout_ms: 10000,
+  }).unwrap().store()
+  let first = written(single.upload_file("single/space +%/café", input, .Create).unwrap())
+  assert(single.get_stream("single/space +%/café", first).unwrap() == GetStreamResult::NotModified)
+  let writer = stream.create(output).unwrap()
+  match single.download("single/space +%/café", writer, length).unwrap() {
+    .Found(download) => { assert(download.etag == first); assert(download.bytes_written == length) },
+    _ => panic("expected complete download"),
+  }
+  writer.close().unwrap()
+  assert(hash.sha256_file(output, length).unwrap() == digest)
+  assert(single.upload_file("single/space +%/café", input, .Create).unwrap() == PutResult::Conflict)
+  let bytes = [0, 128, 255, 0]
+  written(single.put_stream("single/bytes", stream.from_bytes(bytes).unwrap(), 4, hash.sha256(bytes), .Create).unwrap())
+
+  let multipart = S3Client::connect(S3Config {
+    endpoint: endpoint, bucket: "gitwall", region: "us-east-1",
+    credential_provider: environment, multipart_threshold: 1, multipart_part_size: 5242880,
+    timeout_ms: 10000,
+  }).unwrap().store()
+  let mp_etag = written(multipart.upload_file("multipart/space +%/café", input, .Create).unwrap())
+  assert(multipart.upload_file("multipart/space +%/café", input, .Create).unwrap() == PutResult::Conflict)
+  assert(multipart.upload_file("multipart/space +%/café", input, .Match("\"stale\"")).unwrap() == PutResult::Conflict)
+  written(multipart.upload_file("multipart/space +%/café", input, .Match(mp_etag)).unwrap())
+  assert(multipart.upload_file("part-failure/pack", input, .Create).is_err())
+  assert(multipart.upload_file("embedded-error/pack", input, .Create).is_err())
+  assert(multipart.get_stream("embedded-error/pack").unwrap() == GetStreamResult::Missing)
+  assert(multipart.upload_file("ambiguous-complete/pack", input, .Create).is_err())
+  match multipart.get_stream("ambiguous-complete/pack").unwrap() {
+    .Found(object) => object.body.close().unwrap(),
+    _ => panic("ambiguous completion should have committed once"),
+  }
+  written(single.upload_file("truncated/pack", input, .Create).unwrap())
+  let partial = stream.create(output + ".partial").unwrap()
+  assert(single.download("truncated/pack", partial, length).is_err())
+  partial.close().unwrap()
+
+  let program = os.getenv("OBJECT_STORE_TEST_PYTHON") ?? ""
+  let helper = os.getenv("OBJECT_STORE_TEST_CREDENTIAL_HELPER") ?? ""
+  let provider = CredentialProvider::process(program, [helper]).cached()
+  let external = S3Client::connect(S3Config {
+    endpoint: endpoint, bucket: "gitwall", region: "us-east-1", credential_provider: provider,
+  }).unwrap().store()
+  written(external.put("provider/object", [1], .Create).unwrap())
+  let aws_cli = os.getenv("OBJECT_STORE_TEST_AWS_CLI") ?? ""
+  let profile = CredentialProvider::aws_profile("fixture-profile", aws_cli)
+  let profile_store = S3Client::connect(S3Config {
+    endpoint: endpoint, bucket: "gitwall", region: "us-east-1", credential_provider: profile,
+  }).unwrap().store()
+  written(profile_store.put("profile/object", [0, 128, 255], .Create).unwrap())
+  assert(profile.resolve().unwrap().access_key == environment.resolve().unwrap().access_key)
+  let expired = CredentialProvider::fixed(Credentials {
+    access_key: "unused", secret_key: "unused", expires_at: 1.0,
+  })
+  assert(expired.resolve().is_err())
+  print("streaming S3, multipart CAS, provider refresh and transport failures passed")
+}

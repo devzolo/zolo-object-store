@@ -1,0 +1,24 @@
+{
+  "backend": "llvm",
+  "payload_bytes": 134217728,
+  "source_sha256": "6d160342c819d9fa26e7b431e77daad32d295073fc7b52ac6e736f0ce57c7d3e",
+  "baseline_rss_bytes": 13893632,
+  "peak_rss_bytes": 17334272,
+  "rss_samples": 1020,
+  "client_output": [
+    "RSS_BASELINE",
+    "single upload complete",
+    "single download complete",
+    "multipart upload complete",
+    "real MinIO single/multipart streaming, CAS create/match/conflicts and SHA-256 passed"
+  ],
+  "checks": [
+    "single PUT and multipart with real MinIO",
+    "create/match/stale/create-conflict CAS",
+    "conditional GET and missing object",
+    "binary length and streaming SHA-256 verified twice"
+  ],
+  "rss_growth_bytes": 3440640,
+  "max_rss_growth_bytes": 67108864,
+  "rss_within_bound": true
+}

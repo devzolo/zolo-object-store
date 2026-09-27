@@ -1,0 +1,60 @@
+use std::os
+use std::fs
+use std::stream
+use std::hash
+use object_store::{S3Config, S3Client, CredentialProvider, PutResult, GetStreamResult}
+
+fn written(result: PutResult) -> str {
+  return match result { .Written(etag) => etag, .Conflict => panic("unexpected CAS conflict") }
+}
+fn main() {
+  let endpoint = os.getenv("OBJECT_STORE_TEST_ENDPOINT") ?? ""
+  let bucket = os.getenv("OBJECT_STORE_TEST_BUCKET") ?? ""
+  let input = os.getenv("OBJECT_STORE_TEST_FILE") ?? ""
+  let output = os.getenv("OBJECT_STORE_TEST_DOWNLOAD") ?? ""
+  let gate = os.getenv("OBJECT_STORE_TEST_GATE") ?? ""
+  let provider = CredentialProvider::environment()
+  let multipart = S3Client::connect(S3Config {
+    endpoint: endpoint, bucket: bucket, region: "us-east-1",
+    credential_provider: provider,
+  }).unwrap().store()
+  let single = S3Client::connect(S3Config {
+    endpoint: endpoint, bucket: bucket, region: "us-east-1",
+    credential_provider: provider, multipart_threshold: 5368709120,
+  }).unwrap().store()
+  written(single.put("warmup", [0, 128, 255, 0], .Create).unwrap())
+  print("RSS_BASELINE")
+  while !fs.exists(gate) {}
+  let source = stream.open(input).unwrap()
+  let length = source.size().unwrap()
+  source.close().unwrap()
+  assert(length >= 67108864)
+  let expected = hash.sha256_file(input, length).unwrap()
+  let single_etag = written(single.upload_file("single/space +%/café", input, .Create).unwrap())
+  print("single upload complete")
+  assert(single.upload_file("single/space +%/café", input, .Create).unwrap() == PutResult::Conflict)
+  assert(single.get_stream("single/space +%/café", single_etag).unwrap() == GetStreamResult::NotModified)
+  let single_output = stream.create(output + ".single").unwrap()
+  match single.download("single/space +%/café", single_output, length).unwrap() {
+    .Found(download) => { assert(download.bytes_written == length); assert(download.etag == single_etag) },
+    _ => panic("single download missing"),
+  }
+  single_output.close().unwrap()
+  assert(hash.sha256_file(output + ".single", length).unwrap() == expected)
+  print("single download complete")
+  let first = written(multipart.upload_file("multipart/space +%/café", input, .Create).unwrap())
+  print("multipart upload complete")
+  assert(multipart.upload_file("multipart/space +%/café", input, .Create).unwrap() == PutResult::Conflict)
+  assert(multipart.upload_file("multipart/space +%/café", input, .Match("\"stale\"")).unwrap() == PutResult::Conflict)
+  let next = written(multipart.upload_file("multipart/space +%/café", input, .Match(first)).unwrap())
+  assert(multipart.get_stream("multipart/space +%/café", next).unwrap() == GetStreamResult::NotModified)
+  let writer = stream.create(output).unwrap()
+  match multipart.download("multipart/space +%/café", writer, length).unwrap() {
+    .Found(download) => { assert(download.bytes_written == length); assert(download.etag == next) },
+    _ => panic("multipart download missing"),
+  }
+  writer.close().unwrap()
+  assert(hash.sha256_file(output, length).unwrap() == expected)
+  assert(multipart.get_stream("missing").unwrap() == GetStreamResult::Missing)
+  print("real MinIO single/multipart streaming, CAS create/match/conflicts and SHA-256 passed")
+}

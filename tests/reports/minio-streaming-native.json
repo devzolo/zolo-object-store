@@ -1,0 +1,24 @@
+{
+  "backend": "native",
+  "payload_bytes": 134217728,
+  "source_sha256": "dbd0a03a4fdb4eb681ecfdcc751fa1d99feabe0e428e79136154e5d76fca69dd",
+  "baseline_rss_bytes": 14442496,
+  "peak_rss_bytes": 18259968,
+  "rss_samples": 1022,
+  "client_output": [
+    "RSS_BASELINE",
+    "single upload complete",
+    "single download complete",
+    "multipart upload complete",
+    "real MinIO single/multipart streaming, CAS create/match/conflicts and SHA-256 passed"
+  ],
+  "checks": [
+    "single PUT and multipart with real MinIO",
+    "create/match/stale/create-conflict CAS",
+    "conditional GET and missing object",
+    "binary length and streaming SHA-256 verified twice"
+  ],
+  "rss_growth_bytes": 3817472,
+  "max_rss_growth_bytes": 67108864,
+  "rss_within_bound": true
+}

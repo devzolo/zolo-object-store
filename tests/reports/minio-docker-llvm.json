@@ -1,0 +1,34 @@
+{
+  "backend": "llvm",
+  "payload_bytes": 134217728,
+  "storage": {
+    "runtime": "docker",
+    "image": "gitwall-minio:9e49d5e7a648",
+    "image_id": "sha256:f64e8b523ee6bcd3acf0abeaa72e0fd5b0b7c5be191d69fd6aa6c19bd8e9307c",
+    "repo_digests": [
+      "gitwall-minio@sha256:f64e8b523ee6bcd3acf0abeaa72e0fd5b0b7c5be191d69fd6aa6c19bd8e9307c"
+    ]
+  },
+  "storage_mode": "docker",
+  "minio_image_id": "sha256:f64e8b523ee6bcd3acf0abeaa72e0fd5b0b7c5be191d69fd6aa6c19bd8e9307c",
+  "source_sha256": "e3cf0252665f46dc3e0d747b4f482ce3008c9f4f05c69d41d1d975745f811541",
+  "baseline_rss_bytes": 13885440,
+  "peak_rss_bytes": 17035264,
+  "rss_samples": 1095,
+  "client_output": [
+    "RSS_BASELINE",
+    "single upload complete",
+    "single download complete",
+    "multipart upload complete",
+    "real MinIO single/multipart streaming, CAS create/match/conflicts and SHA-256 passed"
+  ],
+  "checks": [
+    "single PUT and multipart with real MinIO",
+    "create/match/stale/create-conflict CAS",
+    "conditional GET and missing object",
+    "binary length and streaming SHA-256 verified twice"
+  ],
+  "rss_growth_bytes": 3149824,
+  "max_rss_growth_bytes": 67108864,
+  "rss_within_bound": true
+}

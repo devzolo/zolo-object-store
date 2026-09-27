@@ -1,0 +1,732 @@
+pub use crate::credentials::{Credentials, CredentialProvider}
+//! Typed conditional object storage with an S3 Signature V4 backend.
+use std::http
+use std::http::{ClientOptions}
+use std::hash
+use std::hex
+use std::string
+use std::os
+use std::stream
+use std::xml
+use std::stream::{Reader, Writer}
+
+/// ETags are opaque server tokens, including their quotes.
+pub struct Object(pub data: [int], pub etag: str)
+
+pub enum GetResult {
+  Found(Object),
+  Missing,
+  NotModified,
+}
+
+pub enum PutCondition {
+  Create,
+  Match(str),
+}
+
+pub enum PutResult {
+  Written(str),
+  Conflict,
+}
+
+/// The caller owns a successful download stream and must close it.
+pub struct StreamObject(pub body: Reader, pub etag: str, pub content_length: int?)
+pub enum GetStreamResult { Found(StreamObject), Missing, NotModified }
+pub struct Download(pub etag: str, pub bytes_written: int)
+pub enum GetDownloadResult { Found(Download), Missing, NotModified }
+
+fn valid_sha256(value: str) -> bool {
+  if value.len() != 64 { return false }
+  for byte in value.bytes() {
+    if !(byte >= 48 && byte <= 57 || byte >= 97 && byte <= 102) { return false }
+  }
+  return true
+}
+
+fn collect_bytes(reader: Reader, max_bytes: int) -> Result<[int], str> {
+  let bytes: [int] = []
+  while true {
+    let part = reader.read()?
+    if part.len() == 0 { break }
+    if bytes.len() + part.len() > max_bytes { return .Err("object stream exceeded its byte limit") }
+    for byte in part { bytes.push(byte) }
+  }
+  return .Ok(bytes)
+}
+
+/// A minimal backend contract. Each put is an atomic conditional write.
+pub struct Store(
+  pub get_object: fn(str, str?) -> Result<GetResult, str>,
+  pub put_object: fn(str, [int], PutCondition) -> Result<PutResult, str>,
+  pub get_stream_object: (fn(str, str?) -> Result<GetStreamResult, str>)? = nil,
+  pub put_stream_object: (fn(str, Reader, int, str, PutCondition) -> Result<PutResult, str>)? = nil,
+  pub upload_file_object: (fn(str, str, PutCondition) -> Result<PutResult, str>)? = nil,
+) {
+  pub fn get(self, key: str, etag: str? = nil) -> Result<GetResult, str> {
+    return (self.get_object)(key, etag)
+  }
+  pub fn put(self, key: str, data: [int], condition: PutCondition) -> Result<PutResult, str> {
+    return (self.put_object)(key, data, condition)
+  }
+
+  /// Legacy callback backends materialize bytes; S3 supplies a true streaming callback.
+  pub fn get_stream(self, key: str, etag: str? = nil) -> Result<GetStreamResult, str> {
+    let callback = self.get_stream_object
+    if callback is not nil { return callback(key, etag) }
+    return match self.get(key, etag)? {
+      .Missing => .Ok(.Missing),
+      .NotModified => .Ok(.NotModified),
+      .Found(object) => .Ok(.Found(StreamObject {
+        body: stream.from_bytes(object.data)?, etag: object.etag, content_length: object.data.len(),
+      })),
+    }
+  }
+
+  /// Takes ownership of body, closing it on success or failure. Digest is lowercase SHA-256.
+  pub fn put_stream(
+    self, key: str, body: Reader, content_length: int, sha256: str, condition: PutCondition,
+  ) -> Result<PutResult, str> {
+    defer body.close()
+    if content_length < 0 || !valid_sha256(sha256) { return .Err("invalid object stream length or SHA-256") }
+    let callback = self.put_stream_object
+    if callback is not nil { return callback(key, body, content_length, sha256, condition) }
+    let data = collect_bytes(body, content_length)?
+    if data.len() != content_length || hash.sha256(data) != sha256 {
+      return .Err("object stream length or SHA-256 did not match")
+    }
+    return self.put(key, data, condition)
+  }
+
+  /// Copies into a caller-owned writer. Partial failures remain errors; the caller
+  /// should use a temporary file and publish it only after successful completion.
+  pub fn download(
+    self, key: str, writer: Writer, max_bytes: int, etag: str? = nil,
+  ) -> Result<GetDownloadResult, str> {
+    return match self.get_stream(key, etag)? {
+      .Missing => .Ok(.Missing),
+      .NotModified => .Ok(.NotModified),
+      .Found(object) => {
+        defer object.body.close()
+        let size = stream.copy_to(object.body, writer, max_bytes)?
+        let expected = object.content_length
+        if expected is not nil && expected != size { return .Err("object download was truncated") }
+        writer.flush()?
+        .Ok(.Found(Download { etag: object.etag, bytes_written: size }))
+      },
+    }
+  }
+
+  /// Hashes and uploads the same open file. The caller must keep it immutable.
+  /// S3's callback automatically selects multipart for configured large files.
+  pub fn upload_file(self, key: str, path: str, condition: PutCondition) -> Result<PutResult, str> {
+    let callback = self.upload_file_object
+    if callback is not nil { return callback(key, path, condition) }
+    let body = stream.open(path)?
+    defer body.close()
+    let size = body.size()?
+    let digest = hash.sha256_reader(body, size)?
+    body.seek(0)?
+    return self.put_stream(key, body, size, digest, condition)
+  }
+}
+
+/// Explicit endpoint and credential source. The bucket must already exist.
+pub struct S3Config(
+  pub endpoint: str,
+  pub bucket: str,
+  pub region: str,
+  pub access_key: str = "",
+  pub secret_key: str = "",
+  pub session_token: str? = nil,
+  pub credential_provider: CredentialProvider? = nil,
+  pub multipart_threshold: int = 67108864,
+  pub multipart_part_size: int = 8388608,
+  pub timeout_ms: int = 300000,
+)
+
+struct SignedRequest(url: str, headers: {str: str})
+
+struct Signature(canonical: str, signed_headers: str, authorization: str)
+
+fn safe_header(value: str) -> bool {
+  for byte in value.bytes() {
+    if byte < 32 || byte == 127 { return false }
+  }
+  return true
+}
+
+fn strong_etag(value: str) -> bool {
+  if value.len() < 2 || !value.starts_with("\"") || !value.ends_with("\"") { return false }
+  let inner = value.slice(1, value.len() - 1)
+  return safe_header(value) && !inner.contains("\"") && !inner.contains(" ")
+}
+
+/// S3 URI encoding preserves slash and never normalizes object-key segments.
+fn uri_encode(value: str, keep_slash: bool) -> str {
+  let digits = "0123456789ABCDEF"
+  let parts: [str] = []
+  for byte in value.bytes() {
+    if (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+       (byte >= 48 && byte <= 57) || byte == 45 || byte == 46 ||
+       byte == 95 || byte == 126 || (keep_slash && byte == 47) {
+      parts.push(string.from_bytes([byte]))
+    } else {
+      let high = byte >> 4
+      let low = byte % 16
+      parts.push("%" + digits.slice(high, high + 1) + digits.slice(low, low + 1))
+    }
+  }
+  return parts.join("")
+}
+
+fn validate_key(key: str) -> Result<nil, str> {
+  if key.len() == 0 { return .Err("object key must not be empty") }
+  // HTTP URL parsers normalize dot-only segments before sending. Refuse them
+  // rather than signing one key and allowing the transport to target another.
+  for segment in key.split("/") {
+    if segment == "." || segment == ".." {
+      return .Err("dot-only object-key segments are not supported by the HTTP transport")
+    }
+  }
+  return .Ok(nil)
+}
+
+fn utc_timestamp() -> Result<str, str> {
+  let value = os.date("!%Y%m%dT%H%M%SZ")
+  if value is str { return .Ok(value) }
+  return .Err("UTC timestamp formatting failed")
+}
+
+fn canonical_header(value: str) -> str {
+  var normalized = value.trim()
+  while normalized.contains("  ") { normalized = normalized.replace("  ", " ") }
+  return normalized
+}
+
+fn sign(
+  config: S3Config, method: str, path: str, headers: {str: str},
+  payload_hash: str, timestamp: str, query: str = "",
+) -> Signature {
+  let names = headers.keys().sort()
+  let lines: [str] = []
+  for name in names { lines.push(name + ":" + canonical_header(headers[name]) + "\n") }
+  let signed_headers = names.join(";")
+  let canonical = method + "\n" + path + "\n" + query + "\n" + lines.join("") +
+    "\n" + signed_headers + "\n" + payload_hash
+  let day = timestamp.slice(0, 8)
+  let credential_scope = day + "/" + config.region + "/s3/aws4_request"
+  let to_sign = "AWS4-HMAC-SHA256\n" + timestamp + "\n" + credential_scope + "\n" + hash.sha256(canonical)
+  let date_key = hex.decode(hash.hmac("sha256", "AWS4" + config.secret_key, day))
+  let region_key = hex.decode(hash.hmac("sha256", date_key, config.region))
+  let service_key = hex.decode(hash.hmac("sha256", region_key, "s3"))
+  let signing_key = hex.decode(hash.hmac("sha256", service_key, "aws4_request"))
+  let signature = hash.hmac("sha256", signing_key, to_sign)
+  let authorization = "AWS4-HMAC-SHA256 Credential=" + config.access_key + "/" + credential_scope +
+    ",SignedHeaders=" + signed_headers + ",Signature=" + signature
+  return Signature { canonical: canonical, signed_headers: signed_headers, authorization: authorization }
+}
+
+fn xml_name(tag: str, expected: str) -> bool {
+  return tag == expected || tag.ends_with(":" + expected)
+}
+
+fn xml_value(node: xml::Node, name: str) -> Result<str, str> {
+  var found: str? = nil
+  for child in node.children {
+    if xml_name(child.tag, name) {
+      if found is not nil || child.children.len() > 0 { return .Err("invalid multipart XML field " + name) }
+      found = child.text
+    }
+  }
+  if found is nil || found == "" { return .Err("multipart XML response missing " + name) }
+  return .Ok(found)
+}
+
+fn xml_escape(value: str) -> str {
+  return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    .replace("\"", "&quot;").replace("'", "&apos;")
+}
+
+fn put_headers(condition: PutCondition) -> Result<{str: str}, str> {
+  let headers: {str: str} = #{}
+  match condition {
+    .Create => { headers["if-none-match"] = "*" },
+    .Match(etag) => {
+      if !strong_etag(etag) { return .Err("conditional PUT requires an opaque quoted strong ETag") }
+      headers["if-match"] = etag
+    },
+  }
+  return .Ok(headers)
+}
+
+fn response_etag(headers: {str: str}) -> Result<str, str> {
+  for name in headers.keys() {
+    if name.to_lower() == "etag" {
+      let etag = headers[name]
+      if !strong_etag(etag) { return .Err("object store returned an invalid strong ETag") }
+      return .Ok(etag)
+    }
+  }
+  return .Err("object store response is missing ETag")
+}
+
+pub struct S3Client(config: S3Config, origin: str, host: str, prefix: str, credentials: CredentialProvider) {
+  /// Validate a path-style endpoint. Construction performs no network requests.
+  pub fn connect(config: S3Config) -> Result<S3Client, str> {
+    let endpoint = config.endpoint
+    var scheme = ""
+    if endpoint.starts_with("https://") { scheme = "https://" }
+    else if endpoint.starts_with("http://") { scheme = "http://" }
+    else { return .Err("S3 endpoint must use http:// or https://") }
+    let remainder = endpoint.slice(scheme.len(), endpoint.len())
+    let split = remainder.index_of("/")
+    let host = if split < 0 { remainder } else { remainder.slice(0, split) }
+    var prefix = if split < 0 { "" } else { remainder.slice(split, remainder.len()) }
+    if host.len() == 0 || host.contains("@") || host.contains("?") || host.contains("#") ||
+       !safe_header(host) || host.contains(" ") || host.contains("\\") {
+      return .Err("S3 endpoint requires a host without credentials, query or fragment")
+    }
+    if prefix.contains("?") || prefix.contains("#") || prefix.contains("%") || !safe_header(prefix) {
+      return .Err("S3 endpoint path must be unescaped and have no query or fragment")
+    }
+    while prefix.ends_with("/") { prefix = prefix.slice(0, prefix.len() - 1) }
+    if prefix.len() > 0 { validate_key(prefix)? }
+    if config.bucket.len() == 0 || config.bucket == "." || config.bucket == ".." ||
+       config.bucket.contains("/") || !safe_header(config.bucket) {
+      return .Err("S3 bucket must be one nonempty path component")
+    }
+    if config.region.len() == 0 || config.region.contains("/") ||
+       config.region.contains(" ") || !safe_header(config.region) {
+      return .Err("S3 region must be valid and nonempty")
+    }
+    if config.timeout_ms < 1 { return .Err("S3 timeout must be positive") }
+    if config.multipart_threshold < 1 || config.multipart_threshold > 5368709120 ||
+       config.multipart_part_size < 5242880 || config.multipart_part_size > 5368709120 {
+      return .Err("multipart threshold must be 1..5GiB and part size 5MiB..5GiB")
+    }
+    let configured = config.credential_provider
+    if configured is not nil && (config.access_key != "" || config.secret_key != "" || config.session_token is not nil) {
+      return .Err("choose a credential provider or explicit credentials, not both")
+    }
+    let credentials = if configured is not nil { configured } else {
+      let fixed = Credentials {
+        access_key: config.access_key, secret_key: config.secret_key, session_token: config.session_token,
+      }
+      fixed.validate(os.time())?
+      CredentialProvider::fixed(fixed)
+    }
+    return .Ok(S3Client {
+      config: config, origin: scheme + host, host: host, prefix: prefix, credentials: credentials,
+    })
+  }
+
+  pub fn store(self) -> Store {
+    return Store {
+      get_object: |key: str, etag: str?| self.get(key, etag),
+      put_object: |key: str, data: [int], condition: PutCondition| self.put(key, data, condition),
+      get_stream_object: |key: str, etag: str?| self.get_stream(key, etag),
+      put_stream_object: |key: str, body: Reader, size: int, digest: str, condition: PutCondition| self.put_stream(key, body, size, digest, condition),
+      upload_file_object: |key: str, path: str, condition: PutCondition| self.upload_file(key, path, condition),
+    }
+  }
+
+  fn prepare_request(
+    self, method: str, key: str, payload_hash: str, condition: {str: str}, query: {str: str},
+  ) -> Result<SignedRequest, str> {
+    validate_key(key)?
+    let credentials = self.credentials.resolve()?
+    let timestamp = utc_timestamp()?
+    let path = uri_encode(self.prefix, true) + "/" + uri_encode(self.config.bucket, false) + "/" + uri_encode(key, true)
+    let pairs: [str] = []
+    for name in query.keys() { pairs.push(uri_encode(name, false) + "=" + uri_encode(query[name], false)) }
+    let canonical_query = pairs.sort().join("&")
+    let headers: {str: str} = #{
+      "host": self.host, "x-amz-content-sha256": payload_hash, "x-amz-date": timestamp,
+    }
+    for name in condition.keys() { headers[name] = condition[name] }
+    if credentials.session_token is not nil { headers["x-amz-security-token"] = credentials.session_token }
+    let signing_config = S3Config {
+      endpoint: self.config.endpoint, bucket: self.config.bucket, region: self.config.region,
+      access_key: credentials.access_key, secret_key: credentials.secret_key,
+      session_token: credentials.session_token,
+    }
+    let signature = sign(signing_config, method, path, headers, payload_hash, timestamp, canonical_query)
+    headers["authorization"] = signature.authorization
+    let suffix = if canonical_query == "" { "" } else { "?" + canonical_query }
+    return .Ok(SignedRequest { url: self.origin + path + suffix, headers: headers })
+  }
+
+  fn request(
+    self, method: str, key: str, data: [int], condition: {str: str},
+    query: {str: str} = #{}, max_response_bytes: int? = nil,
+  ) -> Result<http::ClientResponse, str> {
+    for byte in data {
+      if byte < 0 || byte > 255 { return .Err("object data must contain only bytes 0..255") }
+    }
+    let prepared = self.prepare_request(method, key, hash.sha256(data), condition, query)?
+    let response, error = http.fetch(prepared.url, ClientOptions {
+      method: method, headers: prepared.headers, body_bytes: data,
+      timeout: self.config.timeout_ms, follow_redirects: false, max_response_bytes: max_response_bytes,
+    })
+    if response is nil { return .Err("object store transport failed: " + (error ?? "unknown transport error")) }
+    return .Ok(response)
+  }
+
+  fn request_stream(
+    self, method: str, key: str, body: Reader?, size: int?, digest: str,
+    condition: {str: str}, query: {str: str} = #{},
+  ) -> Result<http::ClientStreamResponse, str> {
+    let prepared = self.prepare_request(method, key, digest, condition, query)?
+    return http.fetch_stream(prepared.url, ClientOptions {
+      method: method, headers: prepared.headers, body_stream: body, content_length: size,
+      timeout: self.config.timeout_ms, follow_redirects: false,
+    })
+  }
+
+  pub fn get_stream(self, key: str, etag: str? = nil) -> Result<GetStreamResult, str> {
+    let headers: {str: str} = #{}
+    if etag is not nil {
+      if !strong_etag(etag) { return .Err("conditional GET requires an opaque quoted strong ETag") }
+      headers["if-none-match"] = etag
+    }
+    let response = self.request_stream("GET", key, nil, nil, hash.sha256(""), headers)?
+    if response.status == 404 { response.body_stream.close()?; return .Ok(.Missing) }
+    if response.status == 304 {
+      response.body_stream.close()?
+      if etag is nil { return .Err("object store returned unsolicited NotModified") }
+      return .Ok(.NotModified)
+    }
+    if response.status != 200 {
+      response.body_stream.close()?
+      return .Err("object store GET failed with HTTP {response.status}")
+    }
+    let token = match response_etag(response.headers) {
+      .Ok(value) => value,
+      .Err(error) => { response.body_stream.close(); return .Err(error) },
+    }
+    return .Ok(.Found(StreamObject {
+      body: response.body_stream, etag: token, content_length: response.content_length,
+    }))
+  }
+
+  pub fn put_stream(
+    self, key: str, body: Reader, content_length: int, sha256: str, condition: PutCondition,
+  ) -> Result<PutResult, str> {
+    defer body.close()
+    if content_length < 0 || content_length > 5368709120 || !valid_sha256(sha256) {
+      return .Err("single PUT requires length 0..5GiB and a lowercase SHA-256; use upload_file for multipart")
+    }
+    let headers = put_headers(condition)?
+    let response = self.request_stream("PUT", key, body, content_length, sha256, headers)?
+    defer response.body_stream.close()
+    if response.status == 412 || response.status == 409 { return .Ok(.Conflict) }
+    if response.status != 200 && response.status != 201 {
+      return .Err("object store PUT failed with HTTP {response.status}")
+    }
+    // PUT is complete at headers; consume its bounded response to observe framing failures.
+    collect_bytes(response.body_stream, 1048576)?
+    return .Ok(.Written(response_etag(response.headers)?))
+  }
+
+  pub fn get(self, key: str, etag: str? = nil) -> Result<GetResult, str> {
+    let headers: {str: str} = #{}
+    if etag is not nil {
+      if !strong_etag(etag) { return .Err("conditional GET requires an opaque quoted strong ETag") }
+      headers["if-none-match"] = etag
+    }
+    let response = self.request("GET", key, [], headers)?
+    if response.status == 404 { return .Ok(.Missing) }
+    if response.status == 304 {
+      if etag is nil { return .Err("object store returned unsolicited NotModified") }
+      return .Ok(.NotModified)
+    }
+    if response.status != 200 { return .Err("object store GET failed with HTTP {response.status}") }
+    let token = response_etag(response.headers)?
+    return .Ok(.Found(Object { data: response.body_bytes, etag: token }))
+  }
+
+  pub fn put(self, key: str, data: [int], condition: PutCondition) -> Result<PutResult, str> {
+    let headers: {str: str} = #{}
+    match condition {
+      .Create => { headers["if-none-match"] = "*" },
+      .Match(etag) => {
+        if !strong_etag(etag) { return .Err("conditional PUT requires an opaque quoted strong ETag") }
+        headers["if-match"] = etag
+      },
+    }
+    let response = self.request("PUT", key, data, headers)?
+    if response.status == 412 || response.status == 409 { return .Ok(.Conflict) }
+    if response.status != 200 && response.status != 201 {
+      return .Err("object store PUT failed with HTTP {response.status}")
+    }
+    return .Ok(.Written(response_etag(response.headers)?))
+  }
+
+  pub fn upload_file(self, key: str, path: str, condition: PutCondition) -> Result<PutResult, str> {
+    validate_key(key)?
+    put_headers(condition)?
+    let body = stream.open(path)?
+    defer body.close()
+    let size = body.size()?
+    if size < 0 || size > 53687091200000 { return .Err("file exceeds S3 multipart capacity") }
+    if size < self.config.multipart_threshold || size == 0 {
+      let digest = hash.sha256_reader(body, size)?
+      body.seek(0)?
+      return self.put_stream(key, body, size, digest, condition)
+    }
+    let started = self.request("POST", key, [], #{}, #{"uploads": ""}, 1048576)?
+    if started.status != 200 { return .Err("multipart initiation failed with HTTP {started.status}") }
+    let document = xml.parse_document(started.body)?
+    if !xml_name(document.tag, "InitiateMultipartUploadResult") {
+      return .Err("multipart initiation returned an invalid XML result")
+    }
+    let upload_id = xml_value(document, "UploadId")?
+    let result = self.complete_file(key, body, size, upload_id, condition)
+    match result {
+      .Ok(.Written(etag)) => { return .Ok(.Written(etag)) },
+      .Ok(.Conflict) => {
+        self.abort_multipart(key, upload_id)?
+        return .Ok(.Conflict)
+      },
+      .Err(error) => {
+        match self.abort_multipart(key, upload_id) {
+          .Ok(_) => { return .Err(error) },
+          .Err(_) => { return .Err(error + "; multipart cleanup failed") },
+        }
+      },
+    }
+  }
+
+  fn abort_multipart(self, key: str, upload_id: str) -> Result<nil, str> {
+    let response = self.request("DELETE", key, [], #{}, #{"uploadId": upload_id}, 1048576)?
+    if response.status != 204 && response.status != 404 {
+      return .Err("multipart abort failed with HTTP {response.status}")
+    }
+    return .Ok(nil)
+  }
+
+  fn upload_part(
+    self, key: str, body: Reader, length: int, digest: str, number: int, upload_id: str,
+  ) -> Result<str, str> {
+    defer body.close()
+    let response = self.request_stream("PUT", key, body, length, digest, #{},
+      #{"partNumber": "{number}", "uploadId": upload_id})?
+    defer response.body_stream.close()
+    if response.status != 200 { return .Err("multipart part failed with HTTP {response.status}") }
+    collect_bytes(response.body_stream, 1048576)?
+    return response_etag(response.headers)
+  }
+
+  fn complete_file(
+    self, key: str, body: Reader, size: int, upload_id: str, condition: PutCondition,
+  ) -> Result<PutResult, str> {
+    var part_size = self.config.multipart_part_size
+    while part_size * 10000 < size {
+      part_size *= 2
+      if part_size > 5368709120 { part_size = 5368709120 }
+    }
+    var offset = 0
+    var number = 1
+    let parts: [str] = []
+    while offset < size {
+      let remaining = size - offset
+      let length = if remaining < part_size { remaining } else { part_size }
+      body.seek(offset)?
+      let hashing = stream.take(body, length)
+      let digest = hash.sha256_reader(hashing, length)?
+      hashing.close()?
+      body.seek(offset)?
+      let part = stream.take(body, length)
+      let etag = self.upload_part(key, part, length, digest, number, upload_id)?
+      parts.push("<Part><PartNumber>{number}</PartNumber><ETag>" + xml_escape(etag) + "</ETag></Part>")
+      offset += length
+      number += 1
+    }
+    let trailing = body.read(1)?
+    if body.size()? != size || trailing.len() != 0 {
+      return .Err("multipart source file changed length during upload")
+    }
+    let payload = "<CompleteMultipartUpload>" + parts.join("") + "</CompleteMultipartUpload>"
+    let headers = put_headers(condition)?
+    headers["content-type"] = "application/xml"
+    let response = self.request("POST", key, payload.bytes(), headers, #{"uploadId": upload_id}, 1048576)?
+    if response.status == 409 || response.status == 412 { return .Ok(.Conflict) }
+    if response.status != 200 { return .Err("multipart completion failed with HTTP {response.status}") }
+    // S3 may start HTTP 200 and then return <Error>; only the success root
+    // and its quoted ETag establish that completion succeeded.
+    let document = xml.parse_document(response.body)?
+    if !xml_name(document.tag, "CompleteMultipartUploadResult") {
+      return .Err("multipart completion returned an error or invalid XML result")
+    }
+    let etag = xml_value(document, "ETag")?
+    if !strong_etag(etag) { return .Err("multipart completion returned an invalid strong ETag") }
+    return .Ok(.Written(etag))
+  }
+}
+
+/// Deterministic, process-local test backend. No persistence or thread safety.
+pub struct MemoryStore(objects: {str: Object}, revision: [int]) {
+  pub fn create() -> MemoryStore { return MemoryStore { objects: #{}, revision: [0] } }
+
+  pub fn store(self) -> Store {
+    return Store {
+      get_object: |key: str, etag: str?| self.get(key, etag),
+      put_object: |key: str, data: [int], condition: PutCondition| self.put(key, data, condition),
+    }
+  }
+
+  pub fn get(self, key: str, etag: str? = nil) -> Result<GetResult, str> {
+    validate_key(key)?
+    if etag is not nil {
+      if !strong_etag(etag) { return .Err("conditional GET requires an opaque quoted strong ETag") }
+    }
+    let object = self.objects.get(key)
+    if object is nil { return .Ok(.Missing) }
+    if etag is not nil && etag == object.etag { return .Ok(.NotModified) }
+    return .Ok(.Found(Object { data: object.data.slice(), etag: object.etag }))
+  }
+
+  pub fn put(self, key: str, data: [int], condition: PutCondition) -> Result<PutResult, str> {
+    validate_key(key)?
+    for byte in data {
+      if byte < 0 || byte > 255 { return .Err("object data must contain only bytes 0..255") }
+    }
+    let current = self.objects.get(key)
+    match condition {
+      .Create => {
+        if current is not nil { return .Ok(.Conflict) }
+      },
+      .Match(etag) => {
+        if !strong_etag(etag) { return .Err("conditional PUT requires an opaque quoted strong ETag") }
+        if current is nil || current.etag != etag { return .Ok(.Conflict) }
+      },
+    }
+    self.revision[0] += 1
+    let etag = "\"memory-{self.revision[0]}\""
+    self.objects[key] = Object { data: data.slice(), etag: etag }
+    return .Ok(.Written(etag))
+  }
+}
+
+@test
+fn aws_get_object_signature_fixture() {
+  let config = S3Config {
+    endpoint: "https://s3.amazonaws.com", bucket: "examplebucket", region: "us-east-1",
+    access_key: "AKIAIOSFODNN7EXAMPLE", secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  }
+  let payload_hash = hash.sha256("")
+  let signature = sign(config, "GET", "/test.txt", #{
+    "host": "examplebucket.s3.amazonaws.com",
+    "range": "bytes=0-9",
+    "x-amz-content-sha256": payload_hash,
+    "x-amz-date": "20130524T000000Z",
+  }, payload_hash, "20130524T000000Z")
+  expect(hash.sha256(signature.canonical)).to_eq("7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972")
+  expect(signature.authorization).to_eq("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+}
+
+@test
+fn aws_put_object_signature_fixture() {
+  let config = S3Config {
+    endpoint: "https://s3.amazonaws.com", bucket: "examplebucket", region: "us-east-1",
+    access_key: "AKIAIOSFODNN7EXAMPLE", secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  }
+  let payload_hash = hash.sha256("Welcome to Amazon S3.".bytes())
+  let signature = sign(config, "PUT", "/test%24file.text", #{
+    "date": "Fri, 24 May 2013 00:00:00 GMT",
+    "host": "examplebucket.s3.amazonaws.com",
+    "x-amz-content-sha256": payload_hash,
+    "x-amz-date": "20130524T000000Z",
+    "x-amz-storage-class": "REDUCED_REDUNDANCY",
+  }, payload_hash, "20130524T000000Z")
+  expect(hash.sha256(signature.canonical)).to_eq("9e0e90d9c76de8fa5b200d8c849cd5b8dc7a3be3951ddb7f6a76b4158342019d")
+  expect(signature.authorization.ends_with("98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd")).to_eq(true)
+}
+
+@test
+fn uri_encodes_utf8_and_preserves_object_slashes() {
+  expect(uri_encode("a b/+%/?#=", true)).to_eq("a%20b/%2B%25/%3F%23%3D")
+  expect(uri_encode("a/b", false)).to_eq("a%2Fb")
+  expect(uri_encode(string.from_bytes([195, 169]), true)).to_eq("%C3%A9")
+  expect(uri_encode("a//b", true)).to_eq("a//b")
+  expect(validate_key("a/../b").is_err()).to_eq(true)
+}
+
+@test
+fn memory_conditional_writes_and_reads() {
+  let store = MemoryStore::create().store()
+  expect(store.get("head").unwrap()).to_eq(GetResult::Missing)
+  let data = [0, 255, 128]
+  let first = store.put("head", data, .Create).unwrap()
+  let etag = match first {
+    .Written(token) => token,
+    .Conflict => { panic("initial write must succeed"); "" },
+  }
+  data[0] = 99
+  expect(store.get("head", etag).unwrap()).to_eq(GetResult::NotModified)
+  expect(store.put("head", [1], .Create).unwrap()).to_eq(PutResult::Conflict)
+  expect(store.put("head", [1], .Match("\"stale\"")).unwrap()).to_eq(PutResult::Conflict)
+  match store.get("head").unwrap() {
+    .Found(object) => {
+      expect(object.data.join(",")).to_eq("0,255,128")
+      object.data[0] = 55
+    },
+    _ => panic("expected stored object"),
+  }
+  match store.get("head").unwrap() {
+    .Found(object) => expect(object.data.join(",")).to_eq("0,255,128"),
+    _ => panic("expected stored object"),
+  }
+  expect(store.put("head", [2], .Match(etag)).unwrap()).not.to_eq(PutResult::Conflict)
+  expect(store.put("head", [3], .Match(etag)).unwrap()).to_eq(PutResult::Conflict)
+  expect(store.put("bad", [256], .Create).is_err()).to_eq(true)
+}
+
+@test
+fn config_and_etag_validation() {
+  let config = S3Config {
+    endpoint: "http://127.0.0.1:9000/base/", bucket: "bucket", region: "local",
+    access_key: "access", secret_key: "secret",
+  }
+  let client = S3Client::connect(config).unwrap()
+  expect(client.origin).to_eq("http://127.0.0.1:9000")
+  expect(client.prefix).to_eq("/base")
+  expect(response_etag(#{"ETag": "\"opaque-2\""}).unwrap()).to_eq("\"opaque-2\"")
+  expect(response_etag(#{}).is_err()).to_eq(true)
+  expect(response_etag(#{"etag": "W/\"weak\""}).is_err()).to_eq(true)
+  expect(strong_etag("\"one\",\"two\"")).to_eq(false)
+}
+
+@test
+fn memory_stream_validates_length_digest_and_cas_before_publication() {
+  let store = MemoryStore::create().store()
+  let bytes = [0, 128, 255]
+  let digest = hash.sha256(bytes)
+  expect(store.put_stream("short", stream.from_bytes(bytes).unwrap(), 4, digest, .Create).is_err()).to_eq(true)
+  expect(store.put_stream("long", stream.from_bytes(bytes).unwrap(), 2, digest, .Create).is_err()).to_eq(true)
+  expect(store.put_stream("digest", stream.from_bytes(bytes).unwrap(), 3, hash.sha256("wrong"), .Create).is_err()).to_eq(true)
+  expect(store.get("short").unwrap()).to_eq(GetResult::Missing)
+  expect(store.get("long").unwrap()).to_eq(GetResult::Missing)
+  expect(store.get("digest").unwrap()).to_eq(GetResult::Missing)
+  let result = store.put_stream("valid", stream.from_bytes(bytes).unwrap(), 3, digest, .Create).unwrap()
+  let etag = match result { .Written(value) => value, .Conflict => panic("unexpected conflict") }
+  expect(store.put_stream("valid", stream.from_bytes(bytes).unwrap(), 3, digest, .Create).unwrap()).to_eq(PutResult::Conflict)
+  expect(store.get_stream("valid", etag).unwrap()).to_eq(GetStreamResult::NotModified)
+  match store.get_stream("valid").unwrap() {
+    .Found(object) => {
+      expect(object.content_length).to_eq(3)
+      expect(collect_bytes(object.body, 3).unwrap().join(",")).to_eq("0,128,255")
+      object.body.close().unwrap()
+    },
+    _ => panic("expected stream"),
+  }
+}
+
+@test
+fn multipart_xml_rejects_error_roots_and_preserves_etags() {
+  let success = xml.parse_document("<CompleteMultipartUploadResult><ETag>&quot;opaque&amp;tag-2&quot;</ETag></CompleteMultipartUploadResult>").unwrap()
+  expect(xml_value(success, "ETag").unwrap()).to_eq("\"opaque&tag-2\"")
+  let error = xml.parse_document("<Error><ETag>&quot;fake&quot;</ETag></Error>").unwrap()
+  expect(xml_name(error.tag, "CompleteMultipartUploadResult")).to_eq(false)
+  expect(xml_value(xml.parse_document("<r><ETag>a</ETag><ETag>b</ETag></r>").unwrap(), "ETag").is_err()).to_eq(true)
+}

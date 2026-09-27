@@ -1,0 +1,35 @@
+{
+  "backend": "vm",
+  "payload_bytes": 134217728,
+  "storage": {
+    "runtime": "docker",
+    "image": "gitwall-minio:9e49d5e7a648",
+    "image_id": "sha256:f64e8b523ee6bcd3acf0abeaa72e0fd5b0b7c5be191d69fd6aa6c19bd8e9307c",
+    "repo_digests": [
+      "gitwall-minio@sha256:f64e8b523ee6bcd3acf0abeaa72e0fd5b0b7c5be191d69fd6aa6c19bd8e9307c"
+    ]
+  },
+  "storage_mode": "docker",
+  "minio_image_id": "sha256:f64e8b523ee6bcd3acf0abeaa72e0fd5b0b7c5be191d69fd6aa6c19bd8e9307c",
+  "source_sha256": "c2fe715da797048c2679c364d3052290fad6bf488a6aca59dc845a5e59226c02",
+  "baseline_rss_bytes": 65679360,
+  "peak_rss_bytes": 71856128,
+  "rss_samples": 962,
+  "client_output": [
+    "synced object_store (path+..) -> blake3:638102eb",
+    "RSS_BASELINE",
+    "single upload complete",
+    "single download complete",
+    "multipart upload complete",
+    "real MinIO single/multipart streaming, CAS create/match/conflicts and SHA-256 passed"
+  ],
+  "checks": [
+    "single PUT and multipart with real MinIO",
+    "create/match/stale/create-conflict CAS",
+    "conditional GET and missing object",
+    "binary length and streaming SHA-256 verified twice"
+  ],
+  "rss_growth_bytes": 6176768,
+  "max_rss_growth_bytes": 67108864,
+  "rss_within_bound": true
+}

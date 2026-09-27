@@ -1,0 +1,20 @@
+//! A fake AWS CLI executable: no cloud access or account configuration.
+use std::process
+use std::os
+schema ExportedCredentials {
+  Version: int,
+  AccessKeyId: str,
+  SecretAccessKey: str,
+  SessionToken: str?,
+}
+fn main() {
+  let args = process.argv()
+  assert(args.len() == 9)
+  assert(args.join("|").ends_with("configure|export-credentials|--format|process|--no-cli-pager|--no-cli-auto-prompt|--profile|fixture-profile"))
+  print(ExportedCredentials {
+    Version: 1,
+    AccessKeyId: os.getenv("AWS_ACCESS_KEY_ID") ?? "",
+    SecretAccessKey: os.getenv("AWS_SECRET_ACCESS_KEY") ?? "",
+    SessionToken: os.getenv("AWS_SESSION_TOKEN"),
+  }.to_json())
+}

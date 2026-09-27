@@ -1,0 +1,7 @@
+[project]
+name = "object-store-tests"
+version = "0.1.0"
+entry = "s3_roundtrip.zolo"
+
+[dependencies]
+object_store = { path = ".." }

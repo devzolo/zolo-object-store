@@ -1,0 +1,53 @@
+//! End-to-end binary S3 contract, run by s3_roundtrip.py against the local fixture.
+use std::os
+use object_store::{S3Config, S3Client, GetResult, PutResult}
+
+fn written(result: PutResult) -> Result<str, str> {
+  return match result {
+    .Written(etag) => .Ok(etag),
+    .Conflict => .Err("unexpected write conflict"),
+  }
+}
+
+fn main() {
+  let endpoint = os.getenv("OBJECT_STORE_TEST_ENDPOINT") ?? ""
+  assert(endpoint.len() > 0)
+  let config = S3Config {
+    endpoint: endpoint, bucket: "gitwall", region: "us-east-1",
+    access_key: "gitwall-test", secret_key: "gitwall-test-secret",
+    session_token: os.getenv("OBJECT_STORE_TEST_SESSION"),
+  }
+  let store = S3Client::connect(config).unwrap().store()
+  let key = "roundtrip/space +%/café"
+  let missing = store.get(key).unwrap()
+  assert(missing == GetResult::Missing)
+  let etag = written(store.put(key, [0, 128, 255, 195, 169, 0], .Create).unwrap()).unwrap()
+  assert(store.get(key, etag).unwrap() == GetResult::NotModified)
+  match store.get(key).unwrap() {
+    .Found(object) => {
+      assert(object.etag == etag)
+      assert(object.data.join(",") == "0,128,255,195,169,0")
+    },
+    _ => panic("expected binary object"),
+  }
+  assert(store.put(key, [99], .Create).unwrap() == PutResult::Conflict)
+  assert(store.put(key, [99], .Match("\"stale\"")).unwrap() == PutResult::Conflict)
+  let next = written(store.put(key, [], .Match(etag)).unwrap()).unwrap()
+  assert(next != etag)
+  match store.get(key).unwrap() {
+    .Found(object) => assert(object.data.len() == 0),
+    _ => panic("expected empty binary object"),
+  }
+  assert(store.put("transient/a", [1], .Create).is_err())
+  assert(store.get("transient/a").unwrap() == GetResult::Missing)
+  assert(store.put("uncertain/a", [2], .Create).is_err())
+  match store.get("uncertain/a").unwrap() {
+    .Found(object) => assert(object.data.join(",") == "2"),
+    _ => panic("expected committed object after ambiguous response"),
+  }
+  assert(store.put("conflict/a", [3], .Create).unwrap() == PutResult::Conflict)
+  assert(store.put("invalid", [-1], .Create).is_err())
+  assert(store.put("invalid", [256], .Create).is_err())
+  assert(store.get("a/../b").is_err())
+  print("s3 binary CAS roundtrip passed")
+}
