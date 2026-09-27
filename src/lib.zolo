@@ -462,6 +462,14 @@ pub struct S3Client(config: S3Config, origin: str, host: str, prefix: str, crede
     return .Ok(.Written(response_etag(response.headers)?))
   }
 
+  /// Delete an owned object. S3 also returns 204 when the key is absent.
+  pub fn delete(self, key: str) -> Result<nil, str> {
+    let response = self.request("DELETE", key, [], #{})?
+    if response.status != 204 {
+      return .Err("object store DELETE failed with HTTP {response.status}")
+    }
+    return .Ok(nil)
+  }
   pub fn upload_file(self, key: str, path: str, condition: PutCondition) -> Result<PutResult, str> {
     validate_key(key)?
     put_headers(condition)?
@@ -729,4 +737,20 @@ fn multipart_xml_rejects_error_roots_and_preserves_etags() {
   let error = xml.parse_document("<Error><ETag>&quot;fake&quot;</ETag></Error>").unwrap()
   expect(xml_name(error.tag, "CompleteMultipartUploadResult")).to_eq(false)
   expect(xml_value(xml.parse_document("<r><ETag>a</ETag><ETag>b</ETag></r>").unwrap(), "ETag").is_err()).to_eq(true)
+}
+
+@test
+fn delete_validates_keys_before_transport_and_signs_the_delete_method() {
+  let client = S3Client::connect(S3Config {
+    endpoint: "http://127.0.0.1:9/base", bucket: "bucket", region: "us-east-1",
+    access_key: "access", secret_key: "secret",
+  }).unwrap()
+  expect(client.delete("").unwrap_err()).to_eq("object key must not be empty")
+  expect(client.delete("owned/../escape").unwrap_err()).to_eq(
+    "dot-only object-key segments are not supported by the HTTP transport",
+  )
+  let request = client.prepare_request("DELETE", "owned/space +%", hash.sha256(""), #{}, #{}).unwrap()
+  expect(request.url).to_eq("http://127.0.0.1:9/base/bucket/owned/space%20%2B%25")
+  expect(request.headers["x-amz-content-sha256"]).to_eq(hash.sha256(""))
+  expect(request.headers["authorization"].starts_with("AWS4-HMAC-SHA256 ")).to_eq(true)
 }
