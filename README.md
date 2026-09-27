@@ -6,8 +6,8 @@ The S3 backend uses path-style HTTP/HTTPS requests and AWS Signature Version 4.
 Cryptography and binary HTTP transport come from Zolo's standard library;
 there is no S3 plugin, Rust extension, or text conversion of object bytes.
 
-This revision requires the Zolo toolchain from feature/gitwall-binary-io (commit a5f853a5 or later).
-See https://github.com/devzolo/zolo-lang/tree/feature/gitwall-binary-io.
+This revision requires the Zolo toolchain from main (commit a0ac06dc or later).
+See https://github.com/devzolo/zolo-lang/tree/main.
 
 ## Use
 
