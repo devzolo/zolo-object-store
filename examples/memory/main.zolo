@@ -1,0 +1,30 @@
+//! A complete application using the same conditional contract as the S3 backend.
+use object_store::MemoryStore
+
+fn main() -> nil fails str {
+  let store = MemoryStore::create().store()
+  let etag = match store.put("example/payload.bin", [0, 128, 255], .Create)? {
+    .Written(value) => value,
+    .Conflict => { fail "initial publication unexpectedly conflicted" },
+  }
+  match store.get("example/payload.bin")? {
+    .Found(object) => {
+      assert(object.data.join(",") == "0,128,255")
+      assert(object.etag == etag)
+    },
+    _ => { fail "published object is missing" },
+  }
+  match store.get("example/payload.bin", etag)? {
+    .NotModified => { },
+    _ => { fail "conditional read did not retain the ETag" },
+  }
+  match store.put("example/payload.bin", [1, 128, 255], .Match(etag))? {
+    .Written(_) => { },
+    .Conflict => { fail "current ETag unexpectedly conflicted" },
+  }
+  match store.put("example/payload.bin", [9], .Match(etag))? {
+    .Conflict => print("binary read, conditional read, CAS and stale-write rejection passed"),
+    .Written(_) => { fail "a stale writer replaced the object" },
+  }
+  nil
+}

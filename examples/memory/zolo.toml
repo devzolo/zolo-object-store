@@ -1,0 +1,10 @@
+[project]
+name = "object-store-memory-example"
+version = "0.1.0"
+entry = "main.zolo"
+
+[compiler]
+type_check = "standard"
+
+[dependencies]
+object_store = { path = "../.." }

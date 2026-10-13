@@ -1,6 +1,6 @@
 [package]
 name = "object_store"
-version = "0.1.0"
+version = "0.1.1"
 description = "Typed conditional object storage and S3 Signature V4 for Zolo"
 license = "MIT"
 authors = ["devzolo"]

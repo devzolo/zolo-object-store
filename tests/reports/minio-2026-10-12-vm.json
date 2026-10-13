@@ -1,0 +1,35 @@
+{
+  "backend": "vm",
+  "payload_bytes": 134217728,
+  "storage": {
+    "runtime": "docker",
+    "image": "object-store-minio:9e49d5e7a648",
+    "image_id": "sha256:a5924ad0b961d26eb182c435d199a42b27a4a2157ae2afb532f0619b3a195d04",
+    "repo_digests": [
+      "object-store-minio@sha256:a5924ad0b961d26eb182c435d199a42b27a4a2157ae2afb532f0619b3a195d04"
+    ]
+  },
+  "storage_mode": "docker",
+  "minio_image_id": "sha256:a5924ad0b961d26eb182c435d199a42b27a4a2157ae2afb532f0619b3a195d04",
+  "source_sha256": "2d05a881040a72d337f132f4a22327e03084c851be75963e243c4517b6053881",
+  "baseline_rss_bytes": 66965504,
+  "peak_rss_bytes": 69402624,
+  "rss_samples": 339,
+  "client_output": [
+    "synced object_store (path+..) -> blake3:1ab6319f",
+    "RSS_BASELINE",
+    "single upload complete",
+    "single download complete",
+    "multipart upload complete",
+    "real MinIO single/multipart streaming, CAS create/match/conflicts and SHA-256 passed"
+  ],
+  "checks": [
+    "single PUT and multipart with real MinIO",
+    "create/match/stale/create-conflict CAS",
+    "conditional GET and missing object",
+    "binary length and streaming SHA-256 verified twice"
+  ],
+  "rss_growth_bytes": 2437120,
+  "max_rss_growth_bytes": 67108864,
+  "rss_within_bound": true
+}

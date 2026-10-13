@@ -1,6 +1,6 @@
 """Exercise 128 MiB streaming against an isolated real MinIO and measure client RSS.
 
-The fixture lives in sibling zolo-gitwall/tests (override --fixture-dir).
+The server fixture and pinned source build are distributed with this library.
 The server, compiler and Python memory are excluded from client transfer RSS.
 """
 from __future__ import annotations
@@ -51,13 +51,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zolo", type=Path, required=True)
     parser.add_argument("--minio", type=Path, help="explicit local executable; default: Docker")
-    parser.add_argument("--minio-image", default="gitwall-minio:9e49d5e7a648", help="fixed Docker tag or digest")
+    parser.add_argument("--minio-image", default="object-store-minio:9e49d5e7a648", help="fixed Docker tag or digest")
     parser.add_argument("--emit", choices=("vm", "native", "llvm"), default="vm")
     parser.add_argument("--megabytes", type=int, default=128)
     parser.add_argument("--max-rss-growth-mib", type=int, default=64)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--fixture-dir", type=Path,
-        default=Path(__file__).resolve().parents[2] / "zolo-gitwall" / "tests")
+        default=Path(__file__).resolve().parent)
     args = parser.parse_args()
     assert 64 <= args.megabytes <= 256
     sys.path.insert(0, str(args.fixture_dir.resolve()))
