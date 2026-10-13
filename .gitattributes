@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# Use Rust highlighting for Zolo source until GitHub supports Zolo.
+*.zolo linguist-language=Rust

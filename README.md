@@ -42,7 +42,7 @@ zolo run main.zolo
 The bucket must already exist. Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 and optionally `AWS_SESSION_TOKEN`; credentials are read through the provider.
 
-```zolo
+```rust
 use object_store::{Store, S3Client, S3Config, CredentialProvider}
 
 fn main() -> nil fails str {

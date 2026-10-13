@@ -29,7 +29,7 @@ Detailed API behavior, ownership and reproducible test procedures.
 
 ## Test backends
 
-```zolo
+```rust
 use object_store::MemoryStore
 
 let store = MemoryStore::create().store()
@@ -41,7 +41,7 @@ cross-thread synchronization.
 
 Custom backends implement the same typed callbacks:
 
-```zolo
+```rust
 use object_store::{Store, PutCondition}
 
 Store {
@@ -145,7 +145,7 @@ thin-pack/cold-reconstruction tests.
 
 ## Streams and files
 
-```zolo
+```rust
 use std::stream
 use object_store::{Store, S3Config, S3Client, CredentialProvider}
 
