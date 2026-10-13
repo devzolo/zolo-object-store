@@ -22,7 +22,7 @@ Add the dependency to your `zolo.toml`, then run `zolo install`:
 
 ```toml
 [dependencies]
-object_store = { git = "https://github.com/devzolo/zolo-object-store.git", rev = "v0.1.1" }
+object_store = { git = "https://github.com/devzolo/zolo-object-store.git", rev = "v0.1.2" }
 ```
 
 Commit the generated `zolo.lock` to retain the resolved source and content identity.

@@ -145,20 +145,35 @@ thin-pack/cold-reconstruction tests.
 
 ## Streams and files
 
-    use std::stream
-    use object_store::{S3Config, S3Client, CredentialProvider}
+```zolo
+use std::stream
+use object_store::{Store, S3Config, S3Client, CredentialProvider}
 
-    let store = S3Client::connect(S3Config {
-      endpoint: "https://s3.us-east-1.amazonaws.com",
-      bucket: "my-existing-bucket",
-      region: "us-east-1",
-      credential_provider: CredentialProvider::environment(),
-    }).unwrap().store()
-
-    let uploaded = store.upload_file("packs/new.pack", "/spool/new.pack", .Create).unwrap()
-    let writer = stream.create("/cache/new.pack.partial").unwrap()
-    let downloaded = store.download("packs/new.pack", writer, 1073741824).unwrap()
-    writer.close().unwrap()
+fn main() -> nil fails str {
+  let client = S3Client::connect(S3Config {
+    endpoint: "https://s3.us-east-1.amazonaws.com",
+    bucket: "my-existing-bucket",
+    region: "us-east-1",
+    credential_provider: CredentialProvider::environment(),
+  })?
+  let store: Store = client.store()
+  match store.upload_file("packs/new.pack", "/spool/new.pack", .Create)? {
+    .Written(_) => { },
+    .Conflict => { fail "the destination object already exists" },
+  }
+  let writer = stream.create("/cache/new.pack.partial")?
+  let downloaded = store.download("packs/new.pack", writer, 1073741824)
+  // Always close the writer, including when the transfer failed.
+  let closed = writer.close()
+  closed?
+  match downloaded? {
+    .Found(transfer) => print("downloaded {transfer.bytes_written} bytes"),
+    _ => { fail "the source object is missing" },
+  }
+  // Only now may the application publish its temporary destination file.
+  nil
+}
+```
 
 The upload_file(key, path, condition) method hashes and uploads an open file
 with bounded memory. The caller must keep the source immutable throughout the
